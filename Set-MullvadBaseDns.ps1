@@ -1,25 +1,41 @@
 #requires -Version 5.1
+
 #requires -RunAsAdministrator
 
+
 <#
+
 .SYNOPSIS
+
 Configures Mullvad Base DNS-over-HTTPS on every physical Ethernet and Wi-Fi adapter.
 
+
+
 .USAGE
+
   .\Set-MullvadBaseDns.ps1 --set
+
   .\Set-MullvadBaseDns.ps1 --reset-default
 
+
+
 .NOTES
+
 Mullvad Base blocks ads, trackers, and malware.
-DoH fallback to unencrypted UDP DNS is disabled.
+
+Version 2.1.0 explicitly writes the per-interface DoH registry state required for Windows 11 to display "On (manual template)".
+
+Fallback to unencrypted UDP/TCP DNS is disabled.
+
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ScriptVersion = '2.1.0'
 
 $Mullvad = [ordered]@{
-    IPv4       = '194.242.2.4'
-    IPv6       = '2a07:e340::4'
+    IPv4        = '194.242.2.4'
+    IPv6        = '2a07:e340::4'
     DohTemplate = 'https://base.dns.mullvad.net/dns-query'
 }
 
@@ -31,6 +47,7 @@ function Show-Usage {
 
 function Get-TargetAdapter {
     # IANA interface types: 6 = Ethernet, 71 = IEEE 802.11 Wi-Fi.
+
     @(Get-NetAdapter -Physical -ErrorAction Stop |
         Where-Object { ([uint32]$_.InterfaceType) -in @(6, 71) } |
         Sort-Object -Property ifIndex -Unique)
@@ -90,6 +107,106 @@ function Set-DohResolverRegistration {
             -AllowFallbackToUdp $false `
             -ErrorAction Stop
     }
+
+    $configured = Get-DnsClientDohServerAddress -ServerAddress $ServerAddress -ErrorAction Stop
+    if (
+        $null -eq $configured -or
+        [string]$configured.DohTemplate -ne $DohTemplate -or
+        -not [bool]$configured.AutoUpgrade -or
+        [bool]$configured.AllowFallbackToUdp
+    ) {
+        throw "DoH resolver registration validation failed for $ServerAddress."
+    }
+}
+
+function Get-AdapterDohRegistryPath {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Adapter,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('IPv4', 'IPv6')]
+        [string]$AddressFamily,
+
+        [Parameter(Mandatory)]
+        [string]$ServerAddress
+    )
+
+    $interfaceGuid = ([guid]$Adapter.InterfaceGuid).ToString('B')
+    $familyKey = if ($AddressFamily -eq 'IPv4') { 'Doh' } else { 'Doh6' }
+
+    "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\InterfaceSpecificParameters\$interfaceGuid\DohInterfaceSettings\$familyKey\$ServerAddress"
+}
+
+function Set-AdapterManualDoh {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Adapter,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('IPv4', 'IPv6')]
+        [string]$AddressFamily,
+
+        [Parameter(Mandatory)]
+        [string]$ServerAddress,
+
+        [Parameter(Mandatory)]
+        [string]$DohTemplate
+    )
+
+    $path = Get-AdapterDohRegistryPath `
+        -Adapter $Adapter `
+        -AddressFamily $AddressFamily `
+        -ServerAddress $ServerAddress
+
+    $null = New-Item -Path $path -Force -ErrorAction Stop
+
+    $null = New-ItemProperty `
+        -Path $path `
+        -Name 'DohFlags' `
+        -PropertyType QWord `
+        -Value ([uint64]1) `
+        -Force `
+        -ErrorAction Stop
+
+    $null = New-ItemProperty `
+        -Path $path `
+        -Name 'DohTemplate' `
+        -PropertyType String `
+        -Value $DohTemplate `
+        -Force `
+        -ErrorAction Stop
+
+    $state = Get-ItemProperty -Path $path -ErrorAction Stop
+    if (
+        [uint64]$state.DohFlags -ne [uint64]1 -or
+        [string]$state.DohTemplate -ne $DohTemplate
+    ) {
+        throw "Per-interface DoH validation failed for '$($Adapter.Name)' $AddressFamily."
+    }
+}
+
+function Remove-AdapterManualDoh {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Adapter,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('IPv4', 'IPv6')]
+        [string]$AddressFamily,
+
+        [Parameter(Mandatory)]
+        [string]$ServerAddress
+    )
+
+    $path = Get-AdapterDohRegistryPath `
+        -Adapter $Adapter `
+        -AddressFamily $AddressFamily `
+        -ServerAddress $ServerAddress
+
+    if (Test-Path -Path $path) {
+        Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+    }
 }
 
 function Set-AdapterMullvadDns {
@@ -121,6 +238,22 @@ function Set-AdapterMullvadDns {
             -ServerAddresses $Mullvad.IPv6 `
             -ErrorAction Stop
     }
+
+    # Windows 11 keeps the Settings-app "On (manual template)" state per
+
+    # interface. The DnsClient cmdlets alone do not reliably create this state.
+
+    Set-AdapterManualDoh `
+        -Adapter $Adapter `
+        -AddressFamily IPv4 `
+        -ServerAddress $Mullvad.IPv4 `
+        -DohTemplate $Mullvad.DohTemplate
+
+    Set-AdapterManualDoh `
+        -Adapter $Adapter `
+        -AddressFamily IPv6 `
+        -ServerAddress $Mullvad.IPv6 `
+        -DohTemplate $Mullvad.DohTemplate
 }
 
 function Reset-AdapterDns {
@@ -133,9 +266,51 @@ function Reset-AdapterDns {
         -InterfaceIndex $Adapter.ifIndex `
         -ResetServerAddresses `
         -ErrorAction Stop
+
+    Remove-AdapterManualDoh `
+        -Adapter $Adapter `
+        -AddressFamily IPv4 `
+        -ServerAddress $Mullvad.IPv4
+
+    Remove-AdapterManualDoh `
+        -Adapter $Adapter `
+        -AddressFamily IPv6 `
+        -ServerAddress $Mullvad.IPv6
 }
 
-function Show-Result {
+function Undo-PartialAdapterConfiguration {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Adapter
+    )
+
+    try {
+        Set-DnsClientServerAddress `
+            -InterfaceIndex $Adapter.ifIndex `
+            -ResetServerAddresses `
+            -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Rollback could not reset DNS addresses on '$($Adapter.Name)': $($_.Exception.Message)"
+    }
+
+    foreach ($entry in @(
+        @{ Family = 'IPv4'; Address = $Mullvad.IPv4 },
+        @{ Family = 'IPv6'; Address = $Mullvad.IPv6 }
+    )) {
+        try {
+            Remove-AdapterManualDoh `
+                -Adapter $Adapter `
+                -AddressFamily $entry.Family `
+                -ServerAddress $entry.Address
+        }
+        catch {
+            Write-Warning "Rollback could not remove $($entry.Family) DoH state from '$($Adapter.Name)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Show-DnsResult {
     param(
         [Parameter(Mandatory)]
         [object[]]$Adapters
@@ -149,12 +324,48 @@ function Show-Result {
         Format-Table -AutoSize
 }
 
+function Show-DohResult {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Adapters
+    )
+
+    $result = foreach ($adapter in $Adapters) {
+        foreach ($entry in @(
+            @{ Family = 'IPv4'; Address = $Mullvad.IPv4 },
+            @{ Family = 'IPv6'; Address = $Mullvad.IPv6 }
+        )) {
+            $path = Get-AdapterDohRegistryPath `
+                -Adapter $adapter `
+                -AddressFamily $entry.Family `
+                -ServerAddress $entry.Address
+
+            if (Test-Path -Path $path) {
+                $state = Get-ItemProperty -Path $path -ErrorAction Stop
+                [pscustomobject]@{
+                    Adapter     = $adapter.Name
+                    Family      = $entry.Family
+                    Server      = $entry.Address
+                    DohFlags    = [uint64]$state.DohFlags
+                    DohTemplate = [string]$state.DohTemplate
+                }
+            }
+        }
+    }
+
+    if (@($result).Count -gt 0) {
+        Write-Host 'Per-interface DoH state:' -ForegroundColor Cyan
+        $result | Format-Table -AutoSize
+    }
+}
+
 if ($args.Count -ne 1 -or $args[0] -notin @('--set', '--reset-default')) {
     Show-Usage
     exit 64
 }
 
 $mode = [string]$args[0]
+Write-Host "Set-MullvadBaseDns.ps1 version $ScriptVersion" -ForegroundColor DarkGray
 
 try {
     Import-Module DnsClient -ErrorAction Stop
@@ -190,13 +401,16 @@ try {
                     Write-Host "Configured: $($adapter.Name)" -ForegroundColor Green
                 }
                 catch {
-                    $failures += "[$($adapter.Name)] $($_.Exception.Message)"
-                    Write-Warning "Failed to configure '$($adapter.Name)': $($_.Exception.Message)"
+                    $message = $_.Exception.Message
+                    Undo-PartialAdapterConfiguration -Adapter $adapter
+                    $failures += "[$($adapter.Name)] $message"
+                    Write-Warning "Failed to configure '$($adapter.Name)': $message"
                 }
             }
 
             Clear-DnsClientCache -ErrorAction SilentlyContinue
-            Show-Result -Adapters $adapters
+            Show-DnsResult -Adapters $adapters
+            Show-DohResult -Adapters $adapters
 
             if ($failures.Count -gt 0) {
                 throw "One or more adapters failed:`n$($failures -join [Environment]::NewLine)"
@@ -220,7 +434,8 @@ try {
                 }
             }
 
-            Write-Host 'Mullvad Base DoH is configured with unencrypted fallback disabled.' -ForegroundColor Green
+            Write-Host 'Mullvad Base DoH is configured as On (manual template) with unencrypted fallback disabled.' -ForegroundColor Green
+            Write-Host 'Close and reopen Windows Settings if it was already open.' -ForegroundColor DarkGray
         }
 
         '--reset-default' {
@@ -237,13 +452,14 @@ try {
             }
 
             Clear-DnsClientCache -ErrorAction SilentlyContinue
-            Show-Result -Adapters $adapters
+            Show-DnsResult -Adapters $adapters
 
             if ($failures.Count -gt 0) {
                 throw "One or more adapters failed:`n$($failures -join [Environment]::NewLine)"
             }
 
             Write-Host 'DNS server addresses were reset to the Windows defaults supplied by automatic network configuration.' -ForegroundColor Green
+            Write-Host 'Mullvad per-interface manual DoH entries were removed.' -ForegroundColor Green
             Write-Host 'The global Mullvad DoH registration was left in place because it is inactive unless an adapter uses the Mullvad resolver IPs.' -ForegroundColor DarkGray
         }
     }
